@@ -1,0 +1,128 @@
+#!/bin/bash
+
+# Dotfile for storing GitHub credentials
+DOTFILE="$HOME/.fork-all"
+
+# Check if jq is installed, if not install it using brew
+if ! [ -x "$(command -v jq)" ]; then
+  echo -e "\033[0;34mjq not found. Attempting to install with Homebrew...\033[0m"
+  if ! [ -x "$(command -v brew)" ]; then
+    echo -e "\033[0;31mError: Homebrew not found. Install it manually then rerun this script.\033[0m"
+    exit 1
+  fi
+  brew install jq
+fi
+
+# Check if dotfile exists
+if [[ ! -f $DOTFILE ]]; then
+  echo -e "\033[0;34mEnter your GitHub username:\033[0m "
+  read USER_NAME
+
+  echo -e "\033[0;34mGo to the following link to generate your GitHub Personal Access Token (PAT). Select 'repo', 'public_repo', and 'read:user' scopes:\nhttps://github.com/settings/tokens/new\033[0m "
+  read TOKEN
+
+  # Save the credentials to the dotfile
+  echo "USER_NAME=$USER_NAME" > $DOTFILE
+  echo "TOKEN=$TOKEN" >> $DOTFILE
+else
+  # If the dotfile exists, load the credentials from it
+  source $DOTFILE
+fi
+
+# Check for repository argument
+if [[ $# -lt 1 ]]; then
+  echo -e "\033[0;31mUsage: $0 organisation/repository [fork_owner/branch]\033[0m"
+  exit 1
+fi
+
+ORG_REPO=$1
+FOR_OWNER_BRANCH=${2}
+API_URL="https://api.github.com/repos/$ORG_REPO/forks"
+HEADER="Authorization: token $TOKEN"
+
+# Check if a fork owner and branch are specified
+if [[ $FOR_OWNER_BRANCH == */* ]]; then
+  FOR_OWNER=${FOR_OWNER_BRANCH%%/*}
+  BRANCH_NAME=${FOR_OWNER_BRANCH#*/}
+else
+  # If no slash is present, assume 'origin' as the fork owner and use the provided argument as the branch name
+  FOR_OWNER="origin"
+  BRANCH_NAME=$FOR_OWNER_BRANCH
+fi
+
+# Determine the directory name
+if [[ -z "$FOR_OWNER_BRANCH" ]]; then
+  DIR_NAME=${ORG_REPO##*/}
+elif [ "$FOR_OWNER" == "origin" ]; then
+  DIR_NAME="$BRANCH_NAME"
+else
+  DIR_NAME="$FOR_OWNER/$BRANCH_NAME"
+fi
+
+# Clone the repository
+if [ -d "$DIR_NAME" ]; then
+  echo -e "\033[0;31mDirectory already exists. Please go and work in the existing directory.\033[0m"
+  exit 1
+fi
+git clone "https://github.com/$ORG_REPO.git" $DIR_NAME
+cd $DIR_NAME
+
+# Add the repository as 'upstream'
+git remote rename origin upstream
+
+# Check if your fork exists
+MY_FORK="https://api.github.com/repos/$USER_NAME/${ORG_REPO##*/}"
+MY_FORK_RESULT=$(curl -s -H "$HEADER" $MY_FORK)
+
+if [ "$(echo $MY_FORK_RESULT | jq -r '.message')" != "Not Found" ]; then
+  # If your fork exists, add it as 'origin'
+  git remote add origin "https://github.com/$USER_NAME/${ORG_REPO##*/}.git"
+fi
+
+FORKS=$(curl -s -H "$HEADER" $API_URL)
+
+echo $FORKS | jq -c '.[]' | while read i; do
+  CLONE_URL=$(echo $i | jq -r '.clone_url')
+  LOGIN_ID=$(echo $i | jq -r '.owner.login')
+
+  git remote add $LOGIN_ID $CLONE_URL
+done
+
+# Fetch upstream and origin branches
+git fetch upstream
+git fetch origin
+
+# Check if the specified fork and branch exist
+if [ -n "$FOR_OWNER" -a -n "$BRANCH_NAME" ]; then
+  if [ "$FOR_OWNER" == "origin" ]; then
+    EXISTS=$(git ls-remote --heads origin $BRANCH_NAME | wc -l)
+    if [ $EXISTS -eq 0 ]; then
+      # If the branch doesn't exist on origin, create it locally
+      git checkout -b $BRANCH_NAME
+    else
+      # If the branch exists on origin, check it out and track it
+      git checkout --track origin/$BRANCH_NAME
+    fi
+  else
+    # For other remotes, check if the branch exists on the fork
+    EXISTS=$(git ls-remote --heads "$FOR_OWNER" $BRANCH_NAME | wc -l)
+    if [ $EXISTS -eq 0 ]; then
+      # If the branch doesn't exist on the fork, print available branches and exit
+      echo -e "\033[0;31mBranch $BRANCH_NAME not found on fork $FOR_OWNER. Available branches:\033[0m"
+      git ls-remote --heads "$FOR_OWNER" | awk -F'/' '{print $NF}'
+      cd ..
+      rm -rf "$BRANCH_NAME"
+
+      # If the current directory is empty, remove it too
+      if [ -z "$(ls -A)" ]; then
+        cd ..
+        rm -rf "$FOR_OWNER"
+      fi
+      exit 1
+    else
+      # If the branch exists on the fork, check it out and track it
+	  git fetch "$FOR_OWNER"
+      git checkout --track "$FOR_OWNER/$BRANCH_NAME"
+    fi
+  fi
+fi
